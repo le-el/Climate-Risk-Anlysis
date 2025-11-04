@@ -51,6 +51,7 @@ preprocessed_chunks/
 physical_risk_analysis_report.*
 *_report.json
 *_report.xlsx
+embeddings_cache/
 
 # Ignore output JSON/Excel/CSV files, but keep framework
 *.json

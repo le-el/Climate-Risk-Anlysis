@@ -10,11 +10,46 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import re
 from tqdm import tqdm
+import numpy as np
+from typing import List, Dict, Optional
 
 # Load environment variables
 load_dotenv()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
+
+# Embedding configuration
+# Set USE_LOCAL_EMBEDDINGS=true in .env to use local models, or leave unset/false for OpenAI
+USE_LOCAL_EMBEDDINGS = os.getenv("USE_LOCAL_EMBEDDINGS", "false").lower() == "true"
+
+# OpenAI model
+OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"  # Cost-effective and fast
+
+# Local model options (sentence-transformers)
+# Popular options:
+# - "all-MiniLM-L6-v2" (fast, 384 dim, ~80MB) - Recommended for speed
+# - "all-mpnet-base-v2" (slower, 768 dim, ~420MB) - Recommended for quality
+# - "multi-qa-MiniLM-L6-cos-v1" (good for search, 384 dim)
+LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+
+# LLM configuration
+# Set USE_OLLAMA=true in .env to use Ollama instead of OpenAI
+USE_OLLAMA = os.getenv("USE_OLLAMA", "false").lower() == "true"
+
+# Ollama model (adjust based on your GPU memory - RTX 3060 has 12GB VRAM)
+# Recommended models for RTX 3060:
+# - "llama3.2:3b" (very fast, good for structured extraction)
+# - "llama3.2:1b" (fastest, smaller context)
+# - "llama3.1:8b" (better quality, slower, may need quantization)
+# - "mistral:7b" (good balance)
+# - "qwen2.5:7b" (excellent for structured tasks)
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+
+# OpenAI LLM model
+OPENAI_LLM_MODEL = os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
+
+# Lazy load local embedding model (only if needed)
+_local_embedding_model = None
 
 def load_framework(framework_path):
     """Load the framework Excel file"""
@@ -43,8 +78,191 @@ def extract_keywords(keyword_string):
         return list(set([kw for kw in keywords if len(kw) > 2]))
     return []
 
-def find_relevant_chunks(chunks, keywords, top_n=6):
-    """Find top chunks containing the keywords"""
+def get_local_embedding_model():
+    """Lazy load local embedding model"""
+    global _local_embedding_model
+    if _local_embedding_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            print(f"  Loading local embedding model: {LOCAL_EMBEDDING_MODEL}...")
+            _local_embedding_model = SentenceTransformer(LOCAL_EMBEDDING_MODEL)
+            print(f"  Local embedding model loaded successfully")
+        except ImportError:
+            raise ImportError(
+                "sentence-transformers not installed. Install it with: pip install sentence-transformers torch"
+            )
+        except Exception as e:
+            raise Exception(f"Error loading local embedding model: {e}")
+    return _local_embedding_model
+
+def get_embedding(text: str, model: Optional[str] = None) -> Optional[List[float]]:
+    """Get embedding for a text using either OpenAI API or local model"""
+    if USE_LOCAL_EMBEDDINGS:
+        # Use local embedding model
+        try:
+            embedding_model = get_local_embedding_model()
+            embedding = embedding_model.encode(text, convert_to_numpy=True, show_progress_bar=False)
+            return embedding.tolist()
+        except Exception as e:
+            print(f"Error getting local embedding: {e}")
+            return None
+    else:
+        # Use OpenAI API
+        if client is None:
+            print("Error: OpenAI client not initialized. Set OPENAI_API_KEY in .env or use local embeddings.")
+            return None
+        try:
+            model_name = model or OPENAI_EMBEDDING_MODEL
+            response = client.embeddings.create(
+                model=model_name,
+                input=text
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            print(f"Error getting OpenAI embedding: {e}")
+            return None
+
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    """Calculate cosine similarity between two vectors"""
+    a = np.array(a)
+    b = np.array(b)
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+def get_or_create_chunk_embeddings(chunks: List[Dict], company_id: str, embeddings_cache_dir: str = "embeddings_cache", batch_size: int = 100) -> List[List[float]]:
+    """Get embeddings for chunks, using cache if available. Uses batch API for efficiency."""
+    os.makedirs(embeddings_cache_dir, exist_ok=True)
+    
+    # Include model info in cache file name to avoid conflicts between OpenAI and local models
+    model_identifier = f"local_{LOCAL_EMBEDDING_MODEL.replace('/', '_')}" if USE_LOCAL_EMBEDDINGS else f"openai_{OPENAI_EMBEDDING_MODEL}"
+    cache_file = os.path.join(embeddings_cache_dir, f"{company_id}_{model_identifier}_embeddings.json")
+    
+    # Create hash of chunk IDs for cache validation
+    chunk_ids = [c.get('chunk_id', '') for c in chunks]
+    
+    # Try to load from cache
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                cached_data = json.load(f)
+                # Verify chunks match
+                if len(cached_data.get('embeddings', [])) == len(chunks):
+                    if cached_data.get('chunk_ids') == chunk_ids:
+                        print(f"  Using cached embeddings for {company_id}")
+                        return cached_data['embeddings']
+        except Exception as e:
+            print(f"  Error loading cache: {e}, regenerating embeddings...")
+    
+    # Generate embeddings in batches for efficiency
+    provider = "local model" if USE_LOCAL_EMBEDDINGS else "OpenAI API"
+    print(f"  Generating embeddings for {len(chunks)} chunks using {provider}...")
+    embeddings = []
+    
+    # Prepare texts for batch embedding
+    texts = [chunk['text'] for chunk in chunks]
+    
+    if USE_LOCAL_EMBEDDINGS:
+        # Use local model with batch processing
+        try:
+            embedding_model = get_local_embedding_model()
+            # Process in batches
+            for i in tqdm(range(0, len(texts), batch_size), desc="    Embedding batches", leave=False):
+                batch_texts = texts[i:i + batch_size]
+                batch_embeddings = embedding_model.encode(
+                    batch_texts,
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                    batch_size=min(batch_size, len(batch_texts))
+                )
+                embeddings.extend(batch_embeddings.tolist())
+        except Exception as e:
+            print(f"  Error in local batch embedding: {e}")
+            # Fallback to individual embeddings
+            for text in texts:
+                embedding = get_embedding(text)
+                # Get default dimension from model if available
+                default_dim = 384 if "MiniLM" in LOCAL_EMBEDDING_MODEL else 768
+                embeddings.append(embedding if embedding else [0.0] * default_dim)
+    else:
+        # Use OpenAI API with batch processing
+        if client is None:
+            raise ValueError("OpenAI client not initialized. Set OPENAI_API_KEY in .env or use local embeddings.")
+        
+        for i in tqdm(range(0, len(texts), batch_size), desc="    Embedding batches", leave=False):
+            batch_texts = texts[i:i + batch_size]
+            try:
+                response = client.embeddings.create(
+                    model=OPENAI_EMBEDDING_MODEL,
+                    input=batch_texts
+                )
+                batch_embeddings = [item.embedding for item in response.data]
+                embeddings.extend(batch_embeddings)
+            except Exception as e:
+                print(f"  Error in batch embedding: {e}")
+                # Fallback to individual embeddings for this batch
+                for text in batch_texts:
+                    embedding = get_embedding(text)
+                    embeddings.append(embedding if embedding else [0.0] * 1536)  # OpenAI default dimension
+    
+    # Save to cache
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump({
+                'embeddings': embeddings,
+                'chunk_ids': chunk_ids,
+                'model': model_identifier
+            }, f)
+    except Exception as e:
+        print(f"  Warning: Could not save embeddings cache: {e}")
+    
+    return embeddings
+
+def find_relevant_chunks_semantic(chunks: List[Dict], measure_name: str, definition: str, keywords: List[str], 
+                                   company_id: str, top_n: int = 6, use_keywords_fallback: bool = True) -> List[Dict]:
+    """Find top chunks using semantic search with embeddings"""
+    
+    if not chunks:
+        return []
+    
+    # Create query text combining measure name, definition, and keywords
+    query_text = f"{measure_name}. {definition}"
+    if keywords:
+        query_text += f" Related terms: {', '.join(keywords[:10])}"
+    
+    # Get query embedding
+    query_embedding = get_embedding(query_text)
+    if query_embedding is None:
+        # Fallback to keyword search if embedding fails
+        if use_keywords_fallback:
+            return find_relevant_chunks_keywords(chunks, keywords, top_n)
+        return []
+    
+    # Get chunk embeddings (with caching)
+    chunk_embeddings = get_or_create_chunk_embeddings(chunks, company_id)
+    
+    # Calculate similarities
+    similarities = []
+    for i, chunk_embedding in enumerate(chunk_embeddings):
+        if chunk_embedding is None:
+            continue
+        similarity = cosine_similarity(query_embedding, chunk_embedding)
+        similarities.append({
+            'index': i,
+            'similarity': similarity,
+            'chunk': chunks[i]
+        })
+    
+    # Sort by similarity and return top N
+    similarities.sort(key=lambda x: x['similarity'], reverse=True)
+    top_chunks = []
+    for item in similarities[:top_n]:
+        chunk = item['chunk'].copy()
+        chunk['similarity_score'] = item['similarity']
+        top_chunks.append(chunk)
+    
+    return top_chunks
+
+def find_relevant_chunks_keywords(chunks, keywords, top_n=6):
+    """Fallback: Find top chunks containing the keywords (original method)"""
     scored_chunks = []
     
     for chunk in chunks:
@@ -73,6 +291,12 @@ def find_relevant_chunks(chunks, keywords, top_n=6):
     # Sort by score and return top N
     scored_chunks.sort(key=lambda x: x["score"], reverse=True)
     return scored_chunks[:top_n]
+
+def find_relevant_chunks(chunks, keywords, top_n=6):
+    """Legacy function - now uses semantic search"""
+    # This is kept for backward compatibility but will need measure_name and definition
+    # In practice, we'll use find_relevant_chunks_semantic directly
+    return find_relevant_chunks_keywords(chunks, keywords, top_n)
 
 def get_json_schema_for_measure(measure_name, definition):
     """Generate JSON schema based on measure"""
@@ -461,7 +685,7 @@ def get_json_schema_for_measure(measure_name, definition):
         }
 
 def extract_with_llm(measure_name, definition, relevant_chunks, keywords):
-    """Extract structured data using GPT-4o-mini"""
+    """Extract structured data using either OpenAI API or Ollama"""
     
     # Get schema for this measure
     schema = get_json_schema_for_measure(measure_name, definition)
@@ -473,40 +697,48 @@ def extract_with_llm(measure_name, definition, relevant_chunks, keywords):
     
     context = "\n---\n".join(context_parts)
     
-    # Build field descriptions from schema
+    # Build field descriptions from schema with specific extraction guidance
     field_descriptions = []
     for field_name, field_type in schema.items():
         desc = f"- {field_name} ({field_type}): "
         if field_type == "number":
-            desc += "Numeric value (use 0 if not stated)"
+            desc += "Extract numeric value from text. Convert phrases: 'semi-annually'=2, 'quarterly'=4, 'annually'=1, 'monthly'=12, 'twice a year'=2, 'every quarter'=4. For percentages, extract number 0-100. Use 0 only if truly not mentioned."
         elif field_type == "boolean":
-            desc += "true or false"
+            desc += "Extract true/false based on explicit statements or clear implications (e.g., 'has a budget' implies true, 'no budget allocated' implies false)"
         elif field_type == "array":
-            desc += "Array of strings or objects"
+            desc += "Extract as array of strings. Look for lists, enumerated items, or multiple mentions separated by commas/semicolons"
         elif field_type == "object":
-            desc += "Object with nested properties"
+            desc += "Extract as object with nested properties"
         else:
-            desc += "String value (leave blank if not stated)"
+            desc += f"Extract relevant text/phrases from the document. Look for names, titles, descriptions related to '{field_name}'. Leave blank only if absolutely not mentioned."
         field_descriptions.append(desc)
     
     fields_text = "\n".join(field_descriptions)
     
-    # Build prompt
+    # Build prompt with better guidance
+    system_message = "You are a data extraction assistant specialized in extracting structured information from corporate documents. Be thorough and extract all relevant information you can find. Return only valid JSON, no additional text or explanations."
+    
     prompt = f"""You are extracting structured data for the measure: "{measure_name}"
 
 Definition: {definition}
 
-Instructions:
-1. Extract ONLY information explicitly stated in the text below
-2. Do NOT guess or infer values
-3. Leave fields blank, 0, false, or empty array if not explicitly stated
-4. For frequencies: "semi-annually" = 2, "quarterly" = 4, "annually" = 1, "monthly" = 12
-5. For percentages: extract as number (0-100)
-6. Always include an "evidence" object with doc_id, page, and the exact snippet
+KEYWORDS TO LOOK FOR: {', '.join(keywords[:10])}
+
+EXTRACTION GUIDELINES:
+1. Extract information that is EXPLICITLY STATED or CLEARLY IMPLIED in the text
+2. Make reasonable inferences from context (e.g., if text says "Audit Committee oversees risk", extract "Audit Committee" as committee name)
+3. For frequencies: Convert text phrases to numbers - "semi-annually" = 2, "quarterly" = 4, "annually" = 1, "monthly" = 12, "twice per year" = 2, "every 3 months" = 4
+4. For percentages: Extract the number (0-100). If text says "98% of subsidiaries", extract 98
+5. For boolean fields: Set to true if the concept is mentioned positively, false if mentioned negatively, false if not mentioned
+6. For arrays: Extract all relevant items mentioned, even if not in a formal list format
+7. For horizons: Look for mentions of "Near-term", "Medium-term", "Long-term", "short-term", "intermediate", etc. and map to ["Near", "Medium", "Long"]
+8. For committee/executive names: Extract the actual name mentioned (e.g., "Audit Committee", "Risk Committee", "John Smith", "Chief Risk Officer")
+
+IMPORTANT: Be thorough - if information is clearly present in the text, extract it. Only leave fields empty/zero if the information is truly absent.
 
 Return a JSON object with these fields:
 {fields_text}
-- evidence: Object with doc_id (string), page (number), and snippet (string) where information was found
+- evidence: Object with doc_id (string), page (number), and snippet (string) - use the MOST relevant snippet where key information was found
 
 Context text:
 {context}
@@ -514,18 +746,60 @@ Context text:
 Return ONLY valid JSON, no additional text:"""
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a data extraction assistant. Return only valid JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1,
-            response_format={"type": "json_object"}
-        )
-        
-        result = json.loads(response.choices[0].message.content)
-        return result
+        if USE_OLLAMA:
+            # Use Ollama
+            import ollama
+            
+            # Combine system message and prompt for Ollama (some models work better with single prompt)
+            full_prompt = f"{system_message}\n\n{prompt}"
+            
+            response = ollama.chat(
+                model=OLLAMA_MODEL,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": prompt}
+                ],
+                options={
+                    "temperature": 0.2,
+                    "num_predict": 2000,  # Limit response length
+                }
+            )
+            
+            # Extract JSON from response
+            response_text = response['message']['content'].strip()
+            
+            # Try to extract JSON if response contains markdown code blocks or extra text
+            import re
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                response_text = json_match.group(0)
+            
+            result = json.loads(response_text)
+            return result
+            
+        else:
+            # Use OpenAI API
+            if client is None:
+                raise ValueError("OpenAI client not initialized. Set OPENAI_API_KEY in .env or use Ollama (set USE_OLLAMA=true).")
+            
+            response = client.chat.completions.create(
+                model=OPENAI_LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,  # Slightly higher to allow more interpretation
+                response_format={"type": "json_object"}
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            return result
+            
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON response: {e}")
+        if USE_OLLAMA:
+            print(f"Ollama response (first 500 chars): {response_text[:500] if 'response_text' in locals() else 'N/A'}")
+        return {}
     except Exception as e:
         print(f"Error in LLM extraction: {e}")
         return {}
@@ -537,25 +811,28 @@ def score_board_oversight(fields):
     hazards = fields.get("hazards_count", 0)
     horizons = set(fields.get("horizons", []))
     committee_name = fields.get("committee_name", "")
+    evidence = fields.get("evidence", {})
+    evidence_text = evidence.get("snippet", "").lower() if evidence else ""
+    
+    # Check if evidence mentions board/committee/risk oversight (fallback if fields empty)
+    has_board_mention = bool(committee_name) or bool(evidence_text and any(kw in evidence_text for kw in ["board", "committee", "oversight", "risk management"]))
     
     # 0: No board reference
-    if not committee_name and hazards == 0:
+    if not has_board_mention and hazards == 0:
         return 0
     
     # 1: Mentions climate oversight without physical risk specificity
-    # (Simplified - assume if we found something, it's at least level 1)
-    if committee_name or hazards > 0:
-        score = 1
-    else:
-        return 0
+    score = 1
     
     # 2: Names a board/committee but physical risk not explicit; or ad hoc review; <50% coverage
-    if committee_name and (freq < 1 or cov < 50):
+    if committee_name or has_board_mention:
         score = 2
     
     # 3: Explicit oversight, ≥ annual, ≥50% coverage, hazards or horizons
-    if freq >= 1 and cov >= 50 and (hazards >= 1 or len(horizons) > 0):
+    if (committee_name or has_board_mention) and freq >= 1 and (cov >= 50 or cov == 0) and (hazards >= 1 or len(horizons) > 0):
         score = 3
+    elif (committee_name or has_board_mention) and freq >= 1:
+        score = 2  # Has frequency but missing coverage/hazards
     
     # 4: Charter covers acute+chronic hazards, ≥2x/year, ≥80% coverage, Near/Medium/Long
     if freq >= 2 and cov >= 80 and hazards >= 2 and {"Near", "Medium", "Long"}.issubset(horizons):
@@ -570,25 +847,34 @@ def score_board_oversight(fields):
 def score_senior_management(fields):
     """Score senior management responsibility"""
     exec_name = fields.get("executive_name", "")
+    exec_title = fields.get("executive_title", "")
     has_budget = fields.get("has_budget", False)
     has_kpis = fields.get("has_kpis", False)
     freq = fields.get("reporting_frequency_per_year", 0)
     scope = fields.get("scope_coverage_pct", 0)
+    reporting_line = fields.get("reporting_line", "")
+    evidence = fields.get("evidence", {})
+    evidence_text = evidence.get("snippet", "").lower() if evidence else ""
     
-    if not exec_name:
+    # Check if evidence mentions executive/management responsibility (fallback)
+    has_mention = bool(exec_name) or bool(exec_title) or bool(evidence_text and any(kw in evidence_text for kw in ["executive", "management", "responsible", "accountable", "lead", "officer"]))
+    
+    if not has_mention:
         return 0
     
     score = 1
-    if exec_name and fields.get("reporting_line", ""):
+    if (exec_name or exec_title) and (reporting_line or "ceo" in evidence_text or "board" in evidence_text):
         score = 2
+    elif has_mention:
+        score = 1
     
-    if exec_name and freq >= 1 and scope >= 50:
+    if (exec_name or exec_title) and freq >= 1 and (scope >= 50 or scope == 0):
         score = 3
     
-    if exec_name and has_budget and has_kpis and freq >= 2 and scope >= 80:
+    if (exec_name or exec_title) and has_budget and has_kpis and freq >= 2 and scope >= 80:
         score = 4
     
-    if exec_name and has_budget and has_kpis and freq >= 2 and scope >= 95 and fields.get("team_size_ftes", 0) > 0:
+    if (exec_name or exec_title) and has_budget and has_kpis and freq >= 2 and scope >= 95 and fields.get("team_size_ftes", 0) > 0:
         score = 5
     
     return score
@@ -600,22 +886,28 @@ def score_erm_integration(fields):
     has_tolerances = fields.get("has_tolerances", False)
     linked_strategy = fields.get("linked_to_strategy", False)
     linked_capex = fields.get("linked_to_capex", False)
+    in_register = fields.get("in_risk_register", False)
     functions = len(fields.get("functions_covered", []))
+    evidence = fields.get("evidence", {})
+    evidence_text = evidence.get("snippet", "").lower() if evidence else ""
     
-    if not in_taxonomy and not has_appetite:
+    # Check if evidence mentions ERM/risk management (fallback)
+    has_erm_mention = bool(evidence_text and any(kw in evidence_text for kw in ["erm", "enterprise risk", "risk management", "risk program", "risk register", "risk taxonomy"]))
+    
+    if not in_taxonomy and not has_appetite and not in_register and not linked_strategy and not has_erm_mention:
         return 0
     
     score = 1
-    if in_taxonomy or has_appetite:
+    if in_taxonomy or has_appetite or in_register or linked_strategy or has_erm_mention:
         score = 2
     
-    if in_taxonomy and has_tolerances and functions >= 1:
+    if (in_taxonomy or in_register) and (has_tolerances or has_appetite) and (functions >= 1 or linked_strategy):
         score = 3
     
-    if in_taxonomy and has_tolerances and linked_strategy and functions >= 3 and fields.get("multi_hazard_analysis", False):
+    if (in_taxonomy or in_register) and (has_tolerances or has_appetite) and linked_strategy and functions >= 3 and fields.get("multi_hazard_analysis", False):
         score = 4
     
-    if in_taxonomy and has_tolerances and linked_strategy and linked_capex and functions >= 5:
+    if (in_taxonomy or in_register) and (has_tolerances or has_appetite) and linked_strategy and linked_capex and functions >= 5:
         score = 5
     
     return score
@@ -1626,6 +1918,55 @@ def score_adaptation_spend(fields):
     
     return score
 
+def generate_reasoning(measure_name, score, fields, rubric_text):
+    """Generate reasoning text explaining why this score was assigned"""
+    evidence = fields.get("evidence", {})
+    evidence_snippet = evidence.get("snippet", "") if evidence else ""
+    
+    # Base reasoning
+    if score == 0:
+        if not evidence_snippet:
+            return "No relevant evidence found in documents for this measure."
+        else:
+            return f"Evidence found mentions related topics but does not meet criteria for score 1. Found: {evidence_snippet[:200]}..."
+    elif score == 1:
+        return f"Basic mention found. Evidence: {evidence_snippet[:200]}..."
+    elif score == 2:
+        return f"Some structure identified. Evidence: {evidence_snippet[:200]}..."
+    elif score == 3:
+        return f"Explicit information found meeting basic requirements. Evidence: {evidence_snippet[:200]}..."
+    elif score == 4:
+        return f"Comprehensive coverage identified. Evidence: {evidence_snippet[:200]}..."
+    elif score == 5:
+        return f"Enterprise-wide implementation with full coverage. Evidence: {evidence_snippet[:200]}..."
+    else:
+        return f"Score {score} assigned based on extracted evidence."
+
+def calculate_confidence(score, fields, relevant_chunks_count):
+    """Calculate confidence level (low, medium, high) based on evidence"""
+    evidence = fields.get("evidence", {})
+    evidence_snippet = evidence.get("snippet", "") if evidence else ""
+    
+    # Count non-empty fields (excluding evidence)
+    non_empty_fields = sum(1 for k, v in fields.items() 
+                          if k != "evidence" and v and 
+                          (not isinstance(v, (int, float)) or v != 0) and
+                          (not isinstance(v, bool) or v) and
+                          (not isinstance(v, (list, dict)) or len(v) > 0))
+    
+    if score == 0:
+        if evidence_snippet and len(evidence_snippet) > 50:
+            return "medium"  # Evidence found but not scored
+        return "low"
+    elif score >= 1:
+        if non_empty_fields >= 3 and relevant_chunks_count >= 3:
+            return "high"
+        elif non_empty_fields >= 1 and relevant_chunks_count >= 2:
+            return "medium"
+        else:
+            return "low"
+    return "low"
+
 def score_measure_by_rubric(measure_name, fields, rubric_text):
     """Generic scoring function using measure-specific functions"""
     # Map measure names to scoring functions
@@ -1704,8 +2045,17 @@ def process_measure_for_company(company_id, measure_row, chunks):
             "error": "No keywords found"
         }
     
-    # Find relevant chunks
-    relevant_chunks = find_relevant_chunks(chunks, keywords)
+    # Find relevant chunks using semantic search
+    relevant_chunks = find_relevant_chunks_semantic(
+        chunks=chunks,
+        measure_name=measure_name,
+        definition=definition,
+        keywords=keywords,
+        company_id=company_id,
+        top_n=6,
+        use_keywords_fallback=True  # Fallback to keyword search if semantic fails
+    )
+    
     if not relevant_chunks:
         return {
             "company_id": company_id,
@@ -1721,12 +2071,27 @@ def process_measure_for_company(company_id, measure_row, chunks):
     # Score using rubric
     score = score_measure_by_rubric(measure_name, extracted_fields, rubric)
     
+    # Get evidence information
+    evidence = extracted_fields.get("evidence", {})
+    source_document = evidence.get("doc_id", relevant_chunks[0]["doc_id"] if relevant_chunks else "") if evidence else (relevant_chunks[0]["doc_id"] if relevant_chunks else "")
+    verbatim_quote = evidence.get("snippet", "") if evidence else ""
+    
+    # Generate reasoning and confidence
+    reasoning = generate_reasoning(measure_name, score, extracted_fields, rubric)
+    confidence = calculate_confidence(score, extracted_fields, len(relevant_chunks))
+    
     return {
         "company_id": company_id,
         "measure": measure_name,
         "category": measure_row['Category'],
+        "measure_number": int(measure_row.name) + 1 if hasattr(measure_row, 'name') and measure_row.name is not None else None,  # Row index as measure number
         "score": score,
         "score_percentage": score * 20,  # Convert to 0-100%
+        "confidence": confidence,
+        "reasoning": reasoning,
+        "verbatim_quote": verbatim_quote,
+        "source_document": source_document,
+        "source_url": "",  # URL not available in chunks, can be added if needed
         "fields": extracted_fields,
         "keywords_used": keywords[:5],  # Store first 5 keywords
         "chunks_analyzed": len(relevant_chunks)
@@ -1735,6 +2100,24 @@ def process_measure_for_company(company_id, measure_row, chunks):
 def run_full_analysis(framework_path, chunks_folder="preprocessed_chunks", output_file="physical_risk_analysis_report.json"):
     """Run full analysis for all companies and measures"""
     print("Loading framework...")
+    
+    # Print configuration
+    print("\n" + "="*80)
+    print("CONFIGURATION")
+    print("="*80)
+    if USE_OLLAMA:
+        print(f"LLM Provider: Ollama")
+        print(f"Ollama Model: {OLLAMA_MODEL}")
+    else:
+        print(f"LLM Provider: OpenAI")
+        print(f"OpenAI Model: {OPENAI_LLM_MODEL}")
+    
+    if USE_LOCAL_EMBEDDINGS:
+        print(f"Embeddings: Local ({LOCAL_EMBEDDING_MODEL})")
+    else:
+        print(f"Embeddings: OpenAI ({OPENAI_EMBEDDING_MODEL})")
+    print("="*80 + "\n")
+    
     framework_df = load_framework(framework_path)
     
     all_results = []
@@ -1765,7 +2148,10 @@ def run_full_analysis(framework_path, chunks_folder="preprocessed_chunks", outpu
         # Process each measure
         for idx, measure_row in tqdm(framework_df.iterrows(), total=len(framework_df), desc=f"  Processing measures"):
             try:
-                result = process_measure_for_company(company_id, measure_row, chunks)
+                # Add measure number (idx) to the row for processing
+                measure_row_copy = measure_row.copy()
+                measure_row_copy.name = idx  # Store index for measure_number
+                result = process_measure_for_company(company_id, measure_row_copy, chunks)
                 all_results.append(result)
                 
                 if result["score"] > 0:
@@ -1784,11 +2170,45 @@ def run_full_analysis(framework_path, chunks_folder="preprocessed_chunks", outpu
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(all_results, f, indent=2, ensure_ascii=False)
     
-    # Also create Excel report
-    results_df = pd.DataFrame(all_results)
+    # Create flattened Excel report similar to CSV structure
+    flattened_results = []
+    for result in all_results:
+        flat_record = {
+            'company_id': result.get('company_id', ''),
+            'measure_number': result.get('measure_number', ''),
+            'measure_name': result.get('measure', ''),
+            'category': result.get('category', ''),
+            'score': result.get('score', 0),
+            'score_percentage': result.get('score_percentage', 0),
+            'confidence': result.get('confidence', ''),
+            'reasoning': result.get('reasoning', ''),
+            'verbatim_quote': result.get('verbatim_quote', ''),
+            'source_document': result.get('source_document', ''),
+            'source_url': result.get('source_url', ''),
+            'keywords_used': ', '.join(result.get('keywords_used', [])),
+            'chunks_analyzed': result.get('chunks_analyzed', 0)
+        }
+        
+        # Flatten fields - extract all field values
+        fields = result.get('fields', {})
+        for field_name, field_value in fields.items():
+            if field_name == 'evidence':
+                # Skip evidence object, already extracted to verbatim_quote/source_document
+                continue
+            elif isinstance(field_value, (list, dict)):
+                # Convert arrays/dicts to JSON string
+                flat_record[f'field_{field_name}'] = json.dumps(field_value) if field_value else ''
+            else:
+                flat_record[f'field_{field_name}'] = field_value
+        
+        flattened_results.append(flat_record)
+    
+    # Create DataFrame and save to Excel
+    results_df = pd.DataFrame(flattened_results)
     excel_file = output_file.replace('.json', '.xlsx')
     
     with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+        # Main detailed results sheet (flattened like CSV)
         results_df.to_excel(writer, sheet_name='Detailed_Results', index=False)
         
         # Summary by category
@@ -1802,10 +2222,15 @@ def run_full_analysis(framework_path, chunks_folder="preprocessed_chunks", outpu
         overall.columns = ['Company_ID', 'Avg_Score', 'Max_Score', 'Min_Score']
         overall.to_excel(writer, sheet_name='Overall_Summary', index=False)
     
+    # Also create CSV file for easier comparison
+    csv_file = output_file.replace('.json', '.csv')
+    results_df.to_csv(csv_file, index=False, encoding='utf-8')
+    
     print(f"\n{'='*80}")
     print("Analysis complete!")
     print(f"Results saved to: {output_file}")
     print(f"Excel report saved to: {excel_file}")
+    print(f"CSV report saved to: {csv_file}")
     print(f"Total results: {len(all_results)}")
     print(f"Average score: {results_df['score'].mean():.2f}/5")
     
