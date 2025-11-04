@@ -79,13 +79,26 @@ def extract_keywords(keyword_string):
     return []
 
 def get_local_embedding_model():
-    """Lazy load local embedding model"""
+    """Lazy load local embedding model with GPU support"""
     global _local_embedding_model
     if _local_embedding_model is None:
         try:
+            import torch
             from sentence_transformers import SentenceTransformer
+            
+            # Check if CUDA is available
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
             print(f"  Loading local embedding model: {LOCAL_EMBEDDING_MODEL}...")
-            _local_embedding_model = SentenceTransformer(LOCAL_EMBEDDING_MODEL)
+            print(f"  Device: {device} ({'GPU' if device == 'cuda' else 'CPU'})")
+            
+            # Load model on the specified device
+            _local_embedding_model = SentenceTransformer(LOCAL_EMBEDDING_MODEL, device=device)
+            
+            if device == 'cuda':
+                print(f"  Model loaded on GPU: {torch.cuda.get_device_name(0)}")
+            else:
+                print(f"  Model loaded on CPU (GPU not available)")
+            
             print(f"  Local embedding model loaded successfully")
         except ImportError:
             raise ImportError(
@@ -144,13 +157,22 @@ def get_or_create_chunk_embeddings(chunks: List[Dict], company_id: str, embeddin
         try:
             with open(cache_file, 'r', encoding='utf-8') as f:
                 cached_data = json.load(f)
+                cached_embeddings = cached_data.get('embeddings', [])
+                cached_chunk_ids = cached_data.get('chunk_ids', [])
+                
                 # Verify chunks match
-                if len(cached_data.get('embeddings', [])) == len(chunks):
-                    if cached_data.get('chunk_ids') == chunk_ids:
-                        print(f"  Using cached embeddings for {company_id}")
-                        return cached_data['embeddings']
+                if len(cached_embeddings) == len(chunks):
+                    if cached_chunk_ids == chunk_ids:
+                        print(f"  ✓ Using cached embeddings for {company_id} ({len(cached_embeddings)} embeddings)")
+                        return cached_embeddings
+                    else:
+                        print(f"  Cache invalid: chunk IDs don't match (chunks may have changed), regenerating...")
+                else:
+                    print(f"  Cache invalid: embedding count mismatch (cached: {len(cached_embeddings)}, current: {len(chunks)}), regenerating...")
         except Exception as e:
             print(f"  Error loading cache: {e}, regenerating embeddings...")
+    else:
+        print(f"  No cache file found at {cache_file}, generating embeddings...")
     
     # Generate embeddings in batches for efficiency
     provider = "local model" if USE_LOCAL_EMBEDDINGS else "OpenAI API"
@@ -163,7 +185,16 @@ def get_or_create_chunk_embeddings(chunks: List[Dict], company_id: str, embeddin
     if USE_LOCAL_EMBEDDINGS:
         # Use local model with batch processing
         try:
+            import torch
             embedding_model = get_local_embedding_model()
+            
+            # Check device being used
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            if device == 'cuda':
+                print(f"    Using GPU for embeddings: {torch.cuda.get_device_name(0)}")
+            else:
+                print(f"    Using CPU for embeddings (GPU not available)")
+            
             # Process in batches
             for i in tqdm(range(0, len(texts), batch_size), desc="    Embedding batches", leave=False):
                 batch_texts = texts[i:i + batch_size]
@@ -770,12 +801,28 @@ Return ONLY valid JSON, no additional text:"""
             
             # Try to extract JSON if response contains markdown code blocks or extra text
             import re
-            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if json_match:
-                response_text = json_match.group(0)
+            # First try to extract from markdown code blocks
+            json_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+            if json_block_match:
+                response_text = json_block_match.group(1)
+            else:
+                # Try to find JSON object in the text
+                json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                if json_match:
+                    response_text = json_match.group(0)
             
-            result = json.loads(response_text)
-            return result
+            # Parse JSON
+            try:
+                result = json.loads(response_text)
+                # Ensure result is a dict
+                if not isinstance(result, dict):
+                    print(f"Warning: Ollama returned non-dict JSON: {type(result)}, returning empty dict")
+                    return {}
+                return result
+            except json.JSONDecodeError as e:
+                print(f"Error parsing Ollama JSON response: {e}")
+                print(f"Response text (first 500 chars): {response_text[:500]}")
+                return {}
             
         else:
             # Use OpenAI API
@@ -793,6 +840,10 @@ Return ONLY valid JSON, no additional text:"""
             )
             
             result = json.loads(response.choices[0].message.content)
+            # Ensure result is a dict
+            if not isinstance(result, dict):
+                print(f"Warning: OpenAI returned non-dict JSON: {type(result)}, returning empty dict")
+                return {}
             return result
             
     except json.JSONDecodeError as e:
@@ -803,6 +854,73 @@ Return ONLY valid JSON, no additional text:"""
     except Exception as e:
         print(f"Error in LLM extraction: {e}")
         return {}
+
+def normalize_extracted_fields(fields):
+    """Normalize extracted fields to ensure it's a dict and handle None values"""
+    # Ensure fields is a dict
+    if not isinstance(fields, dict):
+        print(f"Warning: extracted_fields is not a dict, got {type(fields)}, returning empty dict")
+        return {}
+    
+    # Normalize None values to appropriate defaults and handle type mismatches
+    normalized = {}
+    for key, value in fields.items():
+        if value is None:
+            # Infer default based on key name patterns
+            if isinstance(key, str):
+                if "pct" in key.lower() or "percentage" in key.lower() or "count" in key.lower() or "amount" in key.lower() or "frequency" in key.lower() or "size" in key.lower() or "hours" in key.lower() or "days" in key.lower():
+                    normalized[key] = 0
+                elif "bool" in key.lower() or "has_" in key.lower() or "is_" in key.lower() or key.lower().startswith("has") or key.lower().startswith("is"):
+                    normalized[key] = False
+                elif "array" in key.lower() or "list" in key.lower() or key.lower().endswith("s") and not key.lower().endswith("ss"):
+                    normalized[key] = []
+                elif key.lower() == "evidence":
+                    normalized[key] = {}
+                else:
+                    normalized[key] = ""
+            else:
+                normalized[key] = ""
+        else:
+            # Handle type mismatches - try to convert to expected type based on key name
+            if isinstance(key, str):
+                if ("pct" in key.lower() or "percentage" in key.lower() or "count" in key.lower() or 
+                    "amount" in key.lower() or "frequency" in key.lower() or "size" in key.lower() or 
+                    "hours" in key.lower() or "days" in key.lower()):
+                    # Should be numeric
+                    if not isinstance(value, (int, float)):
+                        try:
+                            normalized[key] = float(value) if value else 0
+                        except (ValueError, TypeError):
+                            normalized[key] = 0
+                    else:
+                        normalized[key] = value if value is not None else 0
+                elif ("bool" in key.lower() or "has_" in key.lower() or "is_" in key.lower() or 
+                      key.lower().startswith("has") or key.lower().startswith("is")):
+                    # Should be boolean
+                    if not isinstance(value, bool):
+                        normalized[key] = bool(value) if value else False
+                    else:
+                        normalized[key] = value
+                elif key.lower() == "evidence":
+                    # Should be dict
+                    if isinstance(value, dict):
+                        normalized[key] = value
+                    else:
+                        normalized[key] = {}
+                elif "array" in key.lower() or "list" in key.lower() or (key.lower().endswith("s") and not key.lower().endswith("ss")):
+                    # Should be list/array
+                    if isinstance(value, list):
+                        normalized[key] = value
+                    elif isinstance(value, str):
+                        normalized[key] = [value] if value else []
+                    else:
+                        normalized[key] = [value] if value else []
+                else:
+                    normalized[key] = value
+            else:
+                normalized[key] = value
+    
+    return normalized
 
 def score_board_oversight(fields):
     """Score board oversight measure using rubric (0-5 scale)"""
@@ -1922,25 +2040,75 @@ def generate_reasoning(measure_name, score, fields, rubric_text):
     """Generate reasoning text explaining why this score was assigned"""
     evidence = fields.get("evidence", {})
     evidence_snippet = evidence.get("snippet", "") if evidence else ""
+    doc_id = evidence.get("doc_id", "") if evidence else ""
+    page = evidence.get("page", "") if evidence else ""
     
-    # Base reasoning
+    # Collect key extracted field values (exclude evidence object)
+    key_fields = []
+    for key, value in fields.items():
+        if key == "evidence":
+            continue
+        if value is None or value == "" or value == [] or value == {} or value == 0 or value is False:
+            continue
+        if isinstance(value, (list, dict)) and len(value) == 0:
+            continue
+        # Format the value for display
+        if isinstance(value, list):
+            if len(value) <= 5:
+                key_fields.append(f"{key}: {', '.join(str(v) for v in value)}")
+            else:
+                key_fields.append(f"{key}: {', '.join(str(v) for v in value[:5])}... (and {len(value)-5} more)")
+        elif isinstance(value, dict):
+            key_fields.append(f"{key}: {json.dumps(value)[:200]}")
+        elif isinstance(value, (int, float)):
+            key_fields.append(f"{key}: {value}")
+        elif isinstance(value, bool):
+            if value:
+                key_fields.append(f"{key}: Yes")
+        else:
+            # String value - include full text if reasonable length, otherwise truncate
+            value_str = str(value)
+            if len(value_str) > 200:
+                key_fields.append(f"{key}: {value_str[:200]}...")
+            else:
+                key_fields.append(f"{key}: {value_str}")
+    
+    # Build detailed reasoning
+    reasoning_parts = []
+    
+    # Add base score explanation
     if score == 0:
         if not evidence_snippet:
-            return "No relevant evidence found in documents for this measure."
+            base_reason = "No relevant evidence found in documents for this measure."
         else:
-            return f"Evidence found mentions related topics but does not meet criteria for score 1. Found: {evidence_snippet[:200]}..."
+            base_reason = "Evidence found mentions related topics but does not meet criteria for score 1."
     elif score == 1:
-        return f"Basic mention found. Evidence: {evidence_snippet[:200]}..."
+        base_reason = "Basic mention found."
     elif score == 2:
-        return f"Some structure identified. Evidence: {evidence_snippet[:200]}..."
+        base_reason = "Some structure identified."
     elif score == 3:
-        return f"Explicit information found meeting basic requirements. Evidence: {evidence_snippet[:200]}..."
+        base_reason = "Explicit information found meeting basic requirements."
     elif score == 4:
-        return f"Comprehensive coverage identified. Evidence: {evidence_snippet[:200]}..."
+        base_reason = "Comprehensive coverage identified."
     elif score == 5:
-        return f"Enterprise-wide implementation with full coverage. Evidence: {evidence_snippet[:200]}..."
+        base_reason = "Enterprise-wide implementation with full coverage."
     else:
-        return f"Score {score} assigned based on extracted evidence."
+        base_reason = f"Score {score} assigned based on extracted evidence."
+    
+    reasoning_parts.append(base_reason)
+    
+    # Add extracted field values
+    if key_fields:
+        reasoning_parts.append(f"Extracted values: {'; '.join(key_fields)}")
+    
+    # Add evidence with source information
+    if evidence_snippet:
+        source_info = f"Source: {doc_id}"
+        if page:
+            source_info += f", Page {page}"
+        reasoning_parts.append(f"{source_info}. Evidence: {evidence_snippet}")
+    
+    return " ".join(reasoning_parts)
 
 def calculate_confidence(score, fields, relevant_chunks_count):
     """Calculate confidence level (low, medium, high) based on evidence"""
@@ -1969,6 +2137,11 @@ def calculate_confidence(score, fields, relevant_chunks_count):
 
 def score_measure_by_rubric(measure_name, fields, rubric_text):
     """Generic scoring function using measure-specific functions"""
+    # Ensure fields is a dict (defensive check)
+    if not isinstance(fields, dict):
+        print(f"Warning: fields is not a dict in score_measure_by_rubric for {measure_name}, got {type(fields)}")
+        return 0
+    
     # Map measure names to scoring functions
     scoring_functions = {
         "Board-level physical risk oversight": score_board_oversight,
@@ -2068,6 +2241,9 @@ def process_measure_for_company(company_id, measure_row, chunks):
     # Extract structured data using LLM
     extracted_fields = extract_with_llm(measure_name, definition, relevant_chunks, keywords)
     
+    # Normalize extracted fields to ensure it's a dict and handle None values
+    extracted_fields = normalize_extracted_fields(extracted_fields)
+    
     # Score using rubric
     score = score_measure_by_rubric(measure_name, extracted_fields, rubric)
     
@@ -2113,7 +2289,17 @@ def run_full_analysis(framework_path, chunks_folder="preprocessed_chunks", outpu
         print(f"OpenAI Model: {OPENAI_LLM_MODEL}")
     
     if USE_LOCAL_EMBEDDINGS:
-        print(f"Embeddings: Local ({LOCAL_EMBEDDING_MODEL})")
+        try:
+            import torch
+            if torch.cuda.is_available():
+                print(f"Embeddings: Local ({LOCAL_EMBEDDING_MODEL})")
+                print(f"GPU: {torch.cuda.get_device_name(0)} (CUDA {torch.version.cuda})")
+            else:
+                print(f"Embeddings: Local ({LOCAL_EMBEDDING_MODEL})")
+                print(f"GPU: Not available (using CPU)")
+        except ImportError:
+            print(f"Embeddings: Local ({LOCAL_EMBEDDING_MODEL})")
+            print(f"GPU: PyTorch not available")
     else:
         print(f"Embeddings: OpenAI ({OPENAI_EMBEDDING_MODEL})")
     print("="*80 + "\n")

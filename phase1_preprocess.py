@@ -101,13 +101,26 @@ def extract_text_from_html(html_path, chunk_size=1000):
     
     return chunks
 
-def preprocess_company_data(data_folder, output_folder="preprocessed_chunks"):
-    """Preprocess all documents for all companies"""
+def preprocess_company_data(data_folder, output_folder="preprocessed_chunks", force_reprocess=False):
+    """Preprocess all documents for all companies
+    
+    Args:
+        data_folder: Folder containing company subfolders
+        output_folder: Folder to save preprocessed chunks
+        force_reprocess: If True, reprocess even if chunks file exists
+    """
     os.makedirs(output_folder, exist_ok=True)
     
     for company_folder in os.listdir(data_folder):
         company_path = os.path.join(data_folder, company_folder)
         if not os.path.isdir(company_path) or company_folder.startswith('.'):
+            continue
+        
+        # Check if chunks already exist
+        output_file = os.path.join(output_folder, f"{company_folder}_chunks.json")
+        if os.path.exists(output_file) and not force_reprocess:
+            print(f"\nSkipping {company_folder} - chunks already exist at {output_file}")
+            print(f"  (Use force_reprocess=True to reprocess)")
             continue
         
         print(f"\nProcessing company: {company_folder}")
@@ -141,8 +154,7 @@ def preprocess_company_data(data_folder, output_folder="preprocessed_chunks"):
                     chunk["doc_id"] = html_file
                 all_chunks.extend(chunks)
         
-        # Save chunks for this company
-        output_file = os.path.join(output_folder, f"{company_folder}_chunks.json")
+        # Save chunks for this company (output_file already defined above)
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(all_chunks, f, indent=2, ensure_ascii=False)
         
