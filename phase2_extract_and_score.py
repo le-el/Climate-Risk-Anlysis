@@ -2273,9 +2273,19 @@ def process_measure_for_company(company_id, measure_row, chunks):
         "chunks_analyzed": len(relevant_chunks)
     }
 
-def run_full_analysis(framework_path, chunks_folder="preprocessed_chunks", output_file="physical_risk_analysis_report.json"):
-    """Run full analysis for all companies and measures"""
+def run_full_analysis(framework_path, chunks_folder="preprocessed_chunks", output_file=None):
+    """Run full analysis for all companies and measures
+    
+    Args:
+        framework_path: Path to the framework Excel file
+        chunks_folder: Folder containing preprocessed chunks
+        output_file: Optional output file path. If None, saves one file per company in Result folder
+    """
     print("Loading framework...")
+    
+    # Create Result folder if it doesn't exist
+    result_folder = "Result"
+    os.makedirs(result_folder, exist_ok=True)
     
     # Print configuration
     print("\n" + "="*80)
@@ -2306,8 +2316,6 @@ def run_full_analysis(framework_path, chunks_folder="preprocessed_chunks", outpu
     
     framework_df = load_framework(framework_path)
     
-    all_results = []
-    
     # Get list of companies from chunks folder
     company_ids = []
     for file in os.listdir(chunks_folder):
@@ -2318,6 +2326,9 @@ def run_full_analysis(framework_path, chunks_folder="preprocessed_chunks", outpu
     print(f"Found {len(company_ids)} companies")
     print(f"Processing {len(framework_df)} measures per company\n")
     
+    all_results = []
+    
+    # Process each company
     for company_id in company_ids:
         print(f"\n{'='*80}")
         print(f"Processing company: {company_id}")
@@ -2331,6 +2342,8 @@ def run_full_analysis(framework_path, chunks_folder="preprocessed_chunks", outpu
         
         print(f"  Loaded {len(chunks)} chunks")
         
+        company_results = []
+        
         # Process each measure
         for idx, measure_row in tqdm(framework_df.iterrows(), total=len(framework_df), desc=f"  Processing measures"):
             try:
@@ -2338,87 +2351,158 @@ def run_full_analysis(framework_path, chunks_folder="preprocessed_chunks", outpu
                 measure_row_copy = measure_row.copy()
                 measure_row_copy.name = idx  # Store index for measure_number
                 result = process_measure_for_company(company_id, measure_row_copy, chunks)
+                company_results.append(result)
                 all_results.append(result)
                 
                 if result["score"] > 0:
                     print(f"    [{measure_row['Category']}] {measure_row['Measure']}: Score {result['score']}/5")
             except Exception as e:
                 print(f"    Error processing {measure_row['Measure']}: {e}")
-                all_results.append({
+                error_result = {
                     "company_id": company_id,
                     "measure": measure_row['Measure'],
                     "category": measure_row['Category'],
                     "score": 0,
                     "error": str(e)
-                })
-    
-    # Save results
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(all_results, f, indent=2, ensure_ascii=False)
-    
-    # Create flattened Excel report similar to CSV structure
-    flattened_results = []
-    for result in all_results:
-        flat_record = {
-            'company_id': result.get('company_id', ''),
-            'measure_number': result.get('measure_number', ''),
-            'measure_name': result.get('measure', ''),
-            'category': result.get('category', ''),
-            'score': result.get('score', 0),
-            'score_percentage': result.get('score_percentage', 0),
-            'confidence': result.get('confidence', ''),
-            'reasoning': result.get('reasoning', ''),
-            'verbatim_quote': result.get('verbatim_quote', ''),
-            'source_document': result.get('source_document', ''),
-            'source_url': result.get('source_url', ''),
-            'keywords_used': ', '.join(result.get('keywords_used', [])),
-            'chunks_analyzed': result.get('chunks_analyzed', 0)
-        }
+                }
+                company_results.append(error_result)
+                all_results.append(error_result)
         
-        # Flatten fields - extract all field values
-        fields = result.get('fields', {})
-        for field_name, field_value in fields.items():
-            if field_name == 'evidence':
-                # Skip evidence object, already extracted to verbatim_quote/source_document
-                continue
-            elif isinstance(field_value, (list, dict)):
-                # Convert arrays/dicts to JSON string
-                flat_record[f'field_{field_name}'] = json.dumps(field_value) if field_value else ''
-            else:
-                flat_record[f'field_{field_name}'] = field_value
+        # Save results for this company in Result folder
+        company_output_base = os.path.join(result_folder, company_id)
+        company_json_file = f"{company_output_base}_report.json"
+        company_excel_file = f"{company_output_base}_report.xlsx"
+        company_csv_file = f"{company_output_base}_report.csv"
         
-        flattened_results.append(flat_record)
-    
-    # Create DataFrame and save to Excel
-    results_df = pd.DataFrame(flattened_results)
-    excel_file = output_file.replace('.json', '.xlsx')
-    
-    with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
-        # Main detailed results sheet (flattened like CSV)
-        results_df.to_excel(writer, sheet_name='Detailed_Results', index=False)
+        # Save JSON for this company
+        with open(company_json_file, 'w', encoding='utf-8') as f:
+            json.dump(company_results, f, indent=2, ensure_ascii=False)
         
-        # Summary by category
-        if 'category' in results_df.columns and 'score' in results_df.columns:
-            summary = results_df.groupby(['company_id', 'category'])['score'].agg(['mean', 'max', 'min', 'count']).reset_index()
-            summary.columns = ['Company_ID', 'Category', 'Avg_Score', 'Max_Score', 'Min_Score', 'Measure_Count']
-            summary.to_excel(writer, sheet_name='Summary_by_Category', index=False)
+        # Create flattened Excel/CSV reports for this company
+        flattened_results = []
+        for result in company_results:
+            flat_record = {
+                'company_id': result.get('company_id', ''),
+                'measure_number': result.get('measure_number', ''),
+                'measure_name': result.get('measure', ''),
+                'category': result.get('category', ''),
+                'score': result.get('score', 0),
+                'score_percentage': result.get('score_percentage', 0),
+                'confidence': result.get('confidence', ''),
+                'reasoning': result.get('reasoning', ''),
+                'verbatim_quote': result.get('verbatim_quote', ''),
+                'source_document': result.get('source_document', ''),
+                'source_url': result.get('source_url', ''),
+                'keywords_used': ', '.join(result.get('keywords_used', [])),
+                'chunks_analyzed': result.get('chunks_analyzed', 0)
+            }
+            
+            # Flatten fields - extract all field values
+            fields = result.get('fields', {})
+            for field_name, field_value in fields.items():
+                if field_name == 'evidence':
+                    # Skip evidence object, already extracted to verbatim_quote/source_document
+                    continue
+                elif isinstance(field_value, (list, dict)):
+                    # Convert arrays/dicts to JSON string
+                    flat_record[f'field_{field_name}'] = json.dumps(field_value) if field_value else ''
+                else:
+                    flat_record[f'field_{field_name}'] = field_value
+            
+            flattened_results.append(flat_record)
         
-        # Overall summary
-        overall = results_df.groupby('company_id')['score'].agg(['mean', 'max', 'min']).reset_index()
-        overall.columns = ['Company_ID', 'Avg_Score', 'Max_Score', 'Min_Score']
-        overall.to_excel(writer, sheet_name='Overall_Summary', index=False)
+        # Create DataFrame and save to Excel/CSV
+        company_df = pd.DataFrame(flattened_results)
+        
+        with pd.ExcelWriter(company_excel_file, engine='openpyxl') as writer:
+            # Main detailed results sheet (flattened like CSV)
+            company_df.to_excel(writer, sheet_name='Detailed_Results', index=False)
+            
+            # Summary by category
+            if 'category' in company_df.columns and 'score' in company_df.columns:
+                summary = company_df.groupby('category')['score'].agg(['mean', 'max', 'min', 'count']).reset_index()
+                summary.columns = ['Category', 'Avg_Score', 'Max_Score', 'Min_Score', 'Measure_Count']
+                summary.to_excel(writer, sheet_name='Summary_by_Category', index=False)
+            
+            # Overall summary
+            overall = pd.DataFrame({
+                'Company_ID': [company_id],
+                'Avg_Score': [company_df['score'].mean()],
+                'Max_Score': [company_df['score'].max()],
+                'Min_Score': [company_df['score'].min()]
+            })
+            overall.to_excel(writer, sheet_name='Overall_Summary', index=False)
+        
+        # Save CSV file
+        company_df.to_csv(company_csv_file, index=False, encoding='utf-8')
+        
+        print(f"\n  ✓ Results saved for {company_id}:")
+        print(f"    - JSON: {company_json_file}")
+        print(f"    - Excel: {company_excel_file}")
+        print(f"    - CSV: {company_csv_file}")
+        print(f"    - Average score: {company_df['score'].mean():.2f}/5")
     
-    # Also create CSV file for easier comparison
-    csv_file = output_file.replace('.json', '.csv')
-    results_df.to_csv(csv_file, index=False, encoding='utf-8')
+    # Also save a combined file if output_file is specified (for backward compatibility)
+    if output_file:
+        output_json = os.path.join(result_folder, output_file) if not os.path.dirname(output_file) else output_file
+        with open(output_json, 'w', encoding='utf-8') as f:
+            json.dump(all_results, f, indent=2, ensure_ascii=False)
+        
+        # Combined Excel/CSV
+        flattened_all = []
+        for result in all_results:
+            flat_record = {
+                'company_id': result.get('company_id', ''),
+                'measure_number': result.get('measure_number', ''),
+                'measure_name': result.get('measure', ''),
+                'category': result.get('category', ''),
+                'score': result.get('score', 0),
+                'score_percentage': result.get('score_percentage', 0),
+                'confidence': result.get('confidence', ''),
+                'reasoning': result.get('reasoning', ''),
+                'verbatim_quote': result.get('verbatim_quote', ''),
+                'source_document': result.get('source_document', ''),
+                'source_url': result.get('source_url', ''),
+                'keywords_used': ', '.join(result.get('keywords_used', [])),
+                'chunks_analyzed': result.get('chunks_analyzed', 0)
+            }
+            
+            fields = result.get('fields', {})
+            for field_name, field_value in fields.items():
+                if field_name == 'evidence':
+                    continue
+                elif isinstance(field_value, (list, dict)):
+                    flat_record[f'field_{field_name}'] = json.dumps(field_value) if field_value else ''
+                else:
+                    flat_record[f'field_{field_name}'] = field_value
+            
+            flattened_all.append(flat_record)
+        
+        all_df = pd.DataFrame(flattened_all)
+        combined_excel = output_json.replace('.json', '.xlsx')
+        combined_csv = output_json.replace('.json', '.csv')
+        
+        with pd.ExcelWriter(combined_excel, engine='openpyxl') as writer:
+            all_df.to_excel(writer, sheet_name='Detailed_Results', index=False)
+            if 'category' in all_df.columns and 'score' in all_df.columns:
+                summary = all_df.groupby(['company_id', 'category'])['score'].agg(['mean', 'max', 'min', 'count']).reset_index()
+                summary.columns = ['Company_ID', 'Category', 'Avg_Score', 'Max_Score', 'Min_Score', 'Measure_Count']
+                summary.to_excel(writer, sheet_name='Summary_by_Category', index=False)
+            overall = all_df.groupby('company_id')['score'].agg(['mean', 'max', 'min']).reset_index()
+            overall.columns = ['Company_ID', 'Avg_Score', 'Max_Score', 'Min_Score']
+            overall.to_excel(writer, sheet_name='Overall_Summary', index=False)
+        
+        all_df.to_csv(combined_csv, index=False, encoding='utf-8')
     
     print(f"\n{'='*80}")
     print("Analysis complete!")
-    print(f"Results saved to: {output_file}")
-    print(f"Excel report saved to: {excel_file}")
-    print(f"CSV report saved to: {csv_file}")
+    print(f"All results saved to: {result_folder}/")
+    print(f"Total companies processed: {len(company_ids)}")
     print(f"Total results: {len(all_results)}")
-    print(f"Average score: {results_df['score'].mean():.2f}/5")
+    if all_results:
+        all_scores = [r.get('score', 0) for r in all_results]
+        print(f"Overall average score: {sum(all_scores)/len(all_scores):.2f}/5")
+    print("="*80)
     
     return all_results
 
@@ -2434,5 +2518,5 @@ if __name__ == "__main__":
     run_full_analysis(
         framework_path='PhysicalRisk_Resilience_Framework.xlsx',
         chunks_folder='preprocessed_chunks',
-        output_file='physical_risk_analysis_report.json'
+        output_file=None  # None means save one file per company in Result folder
     )

@@ -38,7 +38,7 @@ def main():
     run_full_analysis(
         framework_path='PhysicalRisk_Resilience_Framework.xlsx',
         chunks_folder='preprocessed_chunks',
-        output_file='physical_risk_analysis_report.json'
+        output_file=None  # None means save one file per company in Result folder
     )
     
     print("\n" + "="*80)
